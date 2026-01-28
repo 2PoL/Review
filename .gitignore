@@ -10,3 +10,7 @@ wheels/
 .venv
 data_input
 data_output
+
+# IDE files
+.vscode/
+.idea/
