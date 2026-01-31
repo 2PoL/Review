@@ -214,7 +214,7 @@ def merge_data_files(max_workers: int = 4):
     print(f"\n⏱️  数据合并完成，用时: {timedelta(seconds=int(merge_time))}")
     
     # 保存到 Excel 文件
-    output_path = "data_output/合并数据_汇总.xlsx"
+    output_path = "data_output/output.xlsx"
     output_dir = Path(output_path).parent
     output_dir.mkdir(exist_ok=True)
 
