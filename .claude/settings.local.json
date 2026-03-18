@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Skill(xlsx)",
-      "Skill(xlsx:*)"
+      "Skill(xlsx:*)",
+      "Bash(python3:*)",
+      "Bash(pip3 show:*)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(python:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }
