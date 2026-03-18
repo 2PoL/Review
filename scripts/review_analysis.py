@@ -13,12 +13,13 @@ COEFFICIENT = 660
 SUMMARY_KEY = "output"
 SOURCE_KEY = "交易量价数据信息"
 INFO_KEY = "基础信息"
-STATUS_COLUMN = "机组状态"
 RUNNING_STATUS = "运行"
-DEEP_START_DATE = "2026-03-16"
-DEEP_END_DATE = "2026-03-16"
-HIGH_START_DATE = "2026-03-16"
-HIGH_END_DATE = "2026-03-16"
+STATUS_COLUMN_CANDIDATES = ("机组运行状态", "机组状态")
+TIME_COLUMN_CANDIDATES = ("时间", "时段", "时点", "序号", "交易时段", "96点序号", "点位", "时刻")
+DEEP_START_DATE = "2026-03-17"
+DEEP_END_DATE = "2026-03-17"
+HIGH_START_DATE = "2026-03-17"
+HIGH_END_DATE = "2026-03-17"
 DEEP_RESULT_COLUMNS = [
     "单位",
     "日前低价时长（小时）",
@@ -41,6 +42,46 @@ HIGH_RESULT_COLUMNS = [
 
 def format_pct(value: float) -> str:
     return "" if pd.isna(value) else f"{value:.2%}"
+
+
+def resolve_status_column(df: pd.DataFrame) -> str | None:
+    for column in STATUS_COLUMN_CANDIDATES:
+        if column in df.columns:
+            return column
+    return None
+
+
+def build_company_time_group_keys(df: pd.DataFrame) -> list[str]:
+    keys = ["公司名称", "日期"]
+    for column in TIME_COLUMN_CANDIDATES:
+        if column in df.columns and column not in keys:
+            keys.append(column)
+    return keys
+
+
+def compute_company_holding_position(
+    summary_df: pd.DataFrame, contract_power: pd.Series
+) -> pd.Series:
+    status_column = resolve_status_column(summary_df)
+    if status_column is None:
+        raise ValueError(f"{SUMMARY_KEY} 缺少列: 机组运行状态/机组状态")
+
+    group_keys = build_company_time_group_keys(summary_df)
+    groupers = [summary_df[key] for key in group_keys]
+
+    contract_power = contract_power.fillna(0)
+    company_contract_power = contract_power.groupby(groupers).transform("sum")
+
+    running_mask = (
+        summary_df[status_column].fillna("").astype(str).str.strip() == RUNNING_STATUS
+    )
+    running_capacity = summary_df["机组容量"].where(running_mask, 0).fillna(0)
+    company_running_capacity = running_capacity.groupby(groupers).transform("sum")
+
+    holding_ratio = (company_contract_power / company_running_capacity).where(
+        company_running_capacity > 0, 0
+    )
+    return holding_ratio.replace([float("inf"), float("-inf")], 0).fillna(0) * HOURS_PER_RECORD
 
 
 def analyze_spot_prices(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -119,8 +160,6 @@ def ensure_columns(summary_df: pd.DataFrame, info_df: pd.DataFrame) -> None:
     missing = [col for col in required_columns if col not in summary_df.columns]
     if missing:
         raise ValueError(f"{SUMMARY_KEY} 缺少以下列: {missing}")
-    if STATUS_COLUMN not in summary_df.columns:
-        raise ValueError(f"{SUMMARY_KEY} 缺少列: {STATUS_COLUMN}")
     info_required = ["机组容量", "机组名称", "公司名称"]
     missing_info = [col for col in info_required if col not in info_df.columns]
     if missing_info:
@@ -165,8 +204,6 @@ def compute_deep_adjustment(
     })
     summary_df = summary_df.merge(capacity_mapping, on="匹配键", how="left")
     summary_df["机组容量"] = pd.to_numeric(summary_df["机组容量"], errors="coerce").replace(0, pd.NA)
-    status_mask = summary_df[STATUS_COLUMN].fillna("").astype(str).str.strip() == RUNNING_STATUS
-    summary_df = summary_df[status_mask].copy()
     if summary_df.empty:
         return pd.DataFrame(columns=DEEP_RESULT_COLUMNS), summary_df
 
@@ -189,13 +226,12 @@ def compute_deep_adjustment(
     ) & (summary_df["日前出清节点价格"] < contract_price)
     summary_df["深调套利收入"] = (
         (contract_power * HOURS_PER_RECORD - summary_df["日前中标出力"]) *
-        (contract_price - summary_df["日前出清节点价格"]) *
-        summary_df["机组容量"] / COEFFICIENT
+        (contract_price - summary_df["日前出清节点价格"]) / summary_df["机组容量"]
+         * COEFFICIENT
+         / HOURS_PER_RECORD
     ).where(condition, 0).fillna(0)
 
-    capacity_series = summary_df["机组容量"]
-    holding_ratio = (contract_power / capacity_series).where(capacity_series > 0, 0)
-    summary_df["中长期平均持仓"] = (holding_ratio * HOURS_PER_RECORD).fillna(0)
+    summary_df["中长期平均持仓"] = compute_company_holding_position(summary_df, contract_power)
     summary_df["单台深调平均负荷"] = summary_df["日内实际出力"] / summary_df["机组容量"]
     filtered_output = summary_df.copy()
 
@@ -215,6 +251,20 @@ def compute_deep_adjustment(
         中长期平均持仓_=("中长期平均持仓_", "mean"),
         深调套利_元_=("深调套利_元_", "sum"),
     )
+    company_holding_df = (
+        summary_df.groupby(build_company_time_group_keys(summary_df), as_index=False)["中长期平均持仓"]
+        .first()
+        .groupby("公司名称", as_index=False)["中长期平均持仓"]
+        .mean()
+        .rename(columns={"中长期平均持仓": "中长期平均持仓_"})
+    )
+    result_df = (
+        result_df.drop(columns=["中长期平均持仓_"])
+        .merge(company_holding_df, on="公司名称", how="left")
+    )
+    result_df = result_df[
+        ["公司名称", "日前低价时长_小时_", "现货价格_", "深调平均负荷_", "中长期平均持仓_", "深调套利_元_"]
+    ]
     result_df["日前低价时长_小时_"] /= HOURS_PER_RECORD
     result_df.columns = DEEP_RESULT_COLUMNS
     return result_df, filtered_output
@@ -255,13 +305,19 @@ def compute_high_price_stats(
     })
     summary_df = summary_df.merge(capacity_mapping, on="匹配键", how="left")
     summary_df["机组容量"] = pd.to_numeric(summary_df["机组容量"], errors="coerce").replace(0, pd.NA)
-    status_mask = summary_df[STATUS_COLUMN].fillna("").astype(str).str.strip() == RUNNING_STATUS
-    summary_df = summary_df[status_mask].copy()
     if summary_df.empty:
         return pd.DataFrame(columns=HIGH_RESULT_COLUMNS)
 
     day_ahead_high_mask = (summary_df["日前出清节点价格"] >= 300) & (summary_df["日前出清节点价格"] <= 1500)
     real_time_high_mask = (summary_df["日内出清节点价格"] >= 300) & (summary_df["日内出清节点价格"] <= 1500)
+    if has_inter:
+        contract_power_all = (
+            summary_df["省内中长期上网电量"].fillna(0) +
+            summary_df["省间中长期上网电量"].fillna(0)
+        )
+    else:
+        contract_power_all = summary_df["省内中长期上网电量"].fillna(0)
+    summary_df["中长期平均持仓_公司口径"] = compute_company_holding_position(summary_df, contract_power_all)
 
     unit_stats = []
     for unit_key in summary_df["匹配键"].dropna().unique():
@@ -274,16 +330,9 @@ def compute_high_price_stats(
         day_ahead_high_avg_price = day_ahead_high_data["日前出清节点价格"].mean() if len(day_ahead_high_data) > 0 else 0
         real_time_high_avg_price = real_time_high_data["日内出清节点价格"].mean() if len(real_time_high_data) > 0 else 0
 
-        if has_inter:
-            contract_power_da = (
-                day_ahead_high_data["省内中长期上网电量"].fillna(0) +
-                day_ahead_high_data["省间中长期上网电量"].fillna(0)
-            )
-        else:
-            contract_power_da = day_ahead_high_data["省内中长期上网电量"].fillna(0)
         capacity = unit_data["机组容量"].iloc[0]
-        if len(day_ahead_high_data) > 0 and capacity and capacity > 0:
-            mid_long_position = (contract_power_da / capacity).mean() * HOURS_PER_RECORD
+        if len(day_ahead_high_data) > 0:
+            mid_long_position = day_ahead_high_data["中长期平均持仓_公司口径"].mean()
         else:
             mid_long_position = 0
 
