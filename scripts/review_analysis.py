@@ -16,10 +16,10 @@ INFO_KEY = "基础信息"
 RUNNING_STATUS = "运行"
 STATUS_COLUMN_CANDIDATES = ("机组运行状态", "机组状态")
 TIME_COLUMN_CANDIDATES = ("时间", "时段", "时点", "序号", "交易时段", "96点序号", "点位", "时刻")
-DEEP_START_DATE = "2026-03-17"
-DEEP_END_DATE = "2026-03-17"
-HIGH_START_DATE = "2026-03-17"
-HIGH_END_DATE = "2026-03-17"
+DEEP_START_DATE = "2026-03-18"
+DEEP_END_DATE = "2026-03-18"
+HIGH_START_DATE = "2026-03-18"
+HIGH_END_DATE = "2026-03-18"
 DEEP_RESULT_COLUMNS = [
     "单位",
     "日前低价时长（小时）",
@@ -232,7 +232,11 @@ def compute_deep_adjustment(
     ).where(condition, 0).fillna(0)
 
     summary_df["中长期平均持仓"] = compute_company_holding_position(summary_df, contract_power)
-    summary_df["单台深调平均负荷"] = summary_df["日内实际出力"] / summary_df["机组容量"]
+    status_column = resolve_status_column(summary_df)
+    running_mask = summary_df[status_column].fillna("").astype(str).str.strip() == RUNNING_STATUS
+    summary_df["单台深调平均负荷"] = (
+        summary_df["日内实际出力"] / summary_df["机组容量"]
+    ).where(running_mask)
     filtered_output = summary_df.copy()
 
     unit_df = summary_df.groupby("匹配键", as_index=False).agg(
